@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""Mirror a rectangular region of one Wayland output onto another display.
+
+KWin exposes no wlroots-style screencopy protocol, so the capture has to come
+from xdg-desktop-portal's ScreenCast interface. The portal hands back a
+PipeWire node, which GStreamer crops and renders fullscreen on the target
+output. With DMABuf buffers the crop is applied as metadata and the compositor
+does the scaling, so no frame ever touches the CPU.
+
+The crop rectangle is re-read from the config file whenever it changes, so the
+region can be tuned while the game is running.
+"""
+
+import os
+import random
+import signal
+import string
+import sys
+
+import gi
+
+gi.require_version("Gst", "1.0")
+from gi.repository import Gio, GLib, Gst  # noqa: E402
+
+CONFIG_PATH = os.path.expanduser("~/.config/dota-minimap/region.conf")
+TOKEN_PATH = os.path.expanduser("~/.local/state/dota-minimap/restore-token")
+
+PORTAL_BUS = "org.freedesktop.portal.Desktop"
+PORTAL_PATH = "/org/freedesktop/portal/desktop"
+SCREENCAST_IFACE = "org.freedesktop.portal.ScreenCast"
+
+SOURCE_TYPE_MONITOR = 1
+CURSOR_MODE_HIDDEN = 1
+PERSIST_UNTIL_REVOKED = 2
+
+DEFAULTS = {
+    "CROP_X": 0,
+    "CROP_Y": 1065,
+    "CROP_W": 375,
+    "CROP_H": 375,
+}
+DEFAULT_OUTPUT = "HDMI-A-1"
+
+
+def log(message):
+    print(f"[minimap-mirror] {message}", flush=True)
+
+
+def read_config():
+    """Parse the simple KEY=VALUE config, falling back to defaults."""
+    crop = dict(DEFAULTS)
+    output = DEFAULT_OUTPUT
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except FileNotFoundError:
+        return crop, output
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, raw = line.partition("=")
+        key = key.strip().upper()
+        raw = raw.strip()
+        if key == "TARGET_OUTPUT":
+            # Only accept a plain connector name; it is passed to GStreamer.
+            if raw and all(char.isalnum() or char in "-_" for char in raw):
+                output = raw
+        elif key in crop:
+            try:
+                value = int(raw)
+            except ValueError:
+                log(f"ignoring non-numeric {key}={raw}")
+                continue
+            if value < 0:
+                log(f"ignoring negative {key}={value}")
+                continue
+            crop[key] = value
+    return crop, output
+
+
+def random_token():
+    return "dmm" + "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+
+
+class PortalSession:
+    """Minimal xdg-desktop-portal ScreenCast client."""
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.session_handle = None
+        self.node_id = None
+        self.fd = None
+
+    def _request_path(self, token):
+        sender = self.connection.get_unique_name()[1:].replace(".", "_")
+        return f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+
+    def _call_with_response(self, method, args_builder):
+        """Invoke a portal method and block until its Response signal arrives."""
+        token = random_token()
+        loop = GLib.MainLoop()
+        result = {}
+
+        def on_response(_conn, _sender, _path, _iface, _signal, params):
+            result["code"] = params.unpack()[0]
+            result["data"] = params.unpack()[1]
+            loop.quit()
+
+        subscription = self.connection.signal_subscribe(
+            PORTAL_BUS,
+            "org.freedesktop.portal.Request",
+            "Response",
+            self._request_path(token),
+            None,
+            Gio.DBusSignalFlags.NO_MATCH_RULE,
+            on_response,
+        )
+        try:
+            self.connection.call_sync(
+                PORTAL_BUS,
+                PORTAL_PATH,
+                SCREENCAST_IFACE,
+                method,
+                args_builder(token),
+                GLib.VariantType("(o)"),
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None,
+            )
+            GLib.timeout_add_seconds(120, loop.quit)
+            loop.run()
+        finally:
+            self.connection.signal_unsubscribe(subscription)
+
+        if result.get("code") != 0:
+            raise RuntimeError(f"portal {method} failed or was cancelled")
+        return result["data"]
+
+    def create(self):
+        def build(token):
+            return GLib.Variant(
+                "(a{sv})",
+                (
+                    {
+                        "handle_token": GLib.Variant("s", token),
+                        "session_handle_token": GLib.Variant("s", random_token()),
+                    },
+                ),
+            )
+
+        data = self._call_with_response("CreateSession", build)
+        self.session_handle = data["session_handle"]
+
+    def select_sources(self):
+        restore_token = None
+        try:
+            with open(TOKEN_PATH, "r", encoding="utf-8") as handle:
+                restore_token = handle.read().strip() or None
+        except FileNotFoundError:
+            pass
+
+        def build(token):
+            options = {
+                "handle_token": GLib.Variant("s", token),
+                "types": GLib.Variant("u", SOURCE_TYPE_MONITOR),
+                "multiple": GLib.Variant("b", False),
+                "cursor_mode": GLib.Variant("u", CURSOR_MODE_HIDDEN),
+                "persist_mode": GLib.Variant("u", PERSIST_UNTIL_REVOKED),
+            }
+            if restore_token:
+                options["restore_token"] = GLib.Variant("s", restore_token)
+            return GLib.Variant("(oa{sv})", (self.session_handle, options))
+
+        self._call_with_response("SelectSources", build)
+        if restore_token:
+            log("reusing saved screen-capture permission")
+
+    def start(self):
+        def build(token):
+            return GLib.Variant(
+                "(osa{sv})",
+                (
+                    self.session_handle,
+                    "",
+                    {"handle_token": GLib.Variant("s", token)},
+                ),
+            )
+
+        data = self._call_with_response("Start", build)
+        streams = data.get("streams") or []
+        if not streams:
+            raise RuntimeError("portal returned no streams")
+        self.node_id = streams[0][0]
+
+        new_token = data.get("restore_token")
+        if new_token:
+            os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+            with open(TOKEN_PATH, "w", encoding="utf-8") as handle:
+                handle.write(new_token)
+            os.chmod(TOKEN_PATH, 0o600)
+
+    def open_remote(self):
+        reply, fd_list = self.connection.call_with_unix_fd_list_sync(
+            PORTAL_BUS,
+            PORTAL_PATH,
+            SCREENCAST_IFACE,
+            "OpenPipeWireRemote",
+            GLib.Variant("(oa{sv})", (self.session_handle, {})),
+            GLib.VariantType("(h)"),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
+            None,
+        )
+        self.fd = fd_list.get(reply.unpack()[0])
+
+    def close(self):
+        if not self.session_handle:
+            return
+        try:
+            self.connection.call_sync(
+                PORTAL_BUS,
+                self.session_handle,
+                "org.freedesktop.portal.Session",
+                "Close",
+                None,
+                None,
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None,
+            )
+        except GLib.Error:
+            pass
+
+
+class Mirror:
+    def __init__(self, session, use_dmabuf=True):
+        self.session = session
+        self.use_dmabuf = use_dmabuf
+        self.pipeline = None
+        self.crop = None
+        self.source_size = None
+        self.loop = GLib.MainLoop()
+        self.failed = False
+
+    def build(self):
+        self.crop, output = read_config()
+        source = Gst.ElementFactory.make("pipewiresrc", "src")
+        source.set_property("fd", self.session.fd)
+        source.set_property("path", str(self.session.node_id))
+        source.set_property("do-timestamp", True)
+        source.set_property("keepalive-time", 1000)
+
+        self.cropper = Gst.ElementFactory.make("videocrop", "crop")
+        self.sink = Gst.ElementFactory.make("waylandsink", "sink")
+        self.sink.set_property("fullscreen", True)
+        self.sink.set_property("fullscreen-output", output)
+        self.sink.set_property("force-aspect-ratio", False)
+        self.sink.set_property("sync", False)
+
+        self.pipeline = Gst.Pipeline.new("mirror")
+        elements = [source, self.cropper]
+        if not self.use_dmabuf:
+            elements.append(Gst.ElementFactory.make("videoconvert", "convert"))
+            elements.append(Gst.ElementFactory.make("videoscale", "scale"))
+        elements.append(self.sink)
+
+        for element in elements:
+            if element is None:
+                raise RuntimeError("missing GStreamer element")
+            self.pipeline.add(element)
+        for first, second in zip(elements, elements[1:]):
+            if not first.link(second):
+                raise RuntimeError(f"cannot link {first.name} to {second.name}")
+
+        source.get_static_pad("src").add_probe(
+            Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_src_event
+        )
+        log(f"target output {output}, crop {self._crop_summary()}")
+
+    def _crop_summary(self):
+        return (
+            f"{self.crop['CROP_W']}x{self.crop['CROP_H']}"
+            f"+{self.crop['CROP_X']}+{self.crop['CROP_Y']}"
+        )
+
+    def _on_src_event(self, _pad, info):
+        event = info.get_event()
+        if event.type == Gst.EventType.CAPS:
+            structure = event.parse_caps().get_structure(0)
+            ok_w, width = structure.get_int("width")
+            ok_h, height = structure.get_int("height")
+            if ok_w and ok_h:
+                self.source_size = (width, height)
+                GLib.idle_add(self.apply_crop)
+        return Gst.PadProbeReturn.OK
+
+    def apply_crop(self):
+        """Clamp the configured rectangle to the stream and push it to videocrop."""
+        if self.source_size is None:
+            return False
+        src_w, src_h = self.source_size
+        x = min(self.crop["CROP_X"], src_w - 1)
+        y = min(self.crop["CROP_Y"], src_h - 1)
+        w = max(1, min(self.crop["CROP_W"], src_w - x))
+        h = max(1, min(self.crop["CROP_H"], src_h - y))
+
+        self.cropper.set_property("left", x)
+        self.cropper.set_property("top", y)
+        self.cropper.set_property("right", src_w - x - w)
+        self.cropper.set_property("bottom", src_h - y - h)
+        log(f"source {src_w}x{src_h}, showing {w}x{h}+{x}+{y}")
+        return False
+
+    def watch_config(self):
+        config_file = Gio.File.new_for_path(CONFIG_PATH)
+        self.monitor = config_file.monitor_file(Gio.FileMonitorFlags.NONE, None)
+        self.monitor.connect("changed", self._on_config_changed)
+
+    def _on_config_changed(self, _monitor, _file, _other, event):
+        if event not in (
+            Gio.FileMonitorEvent.CHANGES_DONE_HINT,
+            Gio.FileMonitorEvent.CREATED,
+        ):
+            return
+        crop, _output = read_config()
+        if crop == self.crop:
+            return
+        self.crop = crop
+        log(f"config reloaded: {self._crop_summary()}")
+        self.apply_crop()
+
+    def _on_bus_message(self, _bus, message):
+        if message.type == Gst.MessageType.ERROR:
+            error, debug = message.parse_error()
+            log(f"pipeline error: {error.message} ({debug})")
+            self.failed = True
+            self.loop.quit()
+        elif message.type == Gst.MessageType.EOS:
+            log("stream ended")
+            self.loop.quit()
+        return True
+
+    def run(self):
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus_message)
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, self._quit)
+
+        self.pipeline.set_state(Gst.State.PLAYING)
+        self.loop.run()
+        self.pipeline.set_state(Gst.State.NULL)
+        return not self.failed
+
+    def _quit(self):
+        log("stopping")
+        self.loop.quit()
+        return GLib.SOURCE_REMOVE
+
+
+def main():
+    Gst.init(None)
+    connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    session = PortalSession(connection)
+
+    try:
+        log("creating portal session")
+        session.create()
+        log("selecting sources (approve the screen-sharing dialog if it appears)")
+        session.select_sources()
+        log("starting stream")
+        session.start()
+        log("opening PipeWire remote")
+        session.open_remote()
+    except (RuntimeError, GLib.Error) as error:
+        log(f"could not start screen capture: {error}")
+        session.close()
+        return 1
+
+    log(f"capturing PipeWire node {session.node_id}")
+
+    try:
+        for use_dmabuf in (True, False):
+            mirror = Mirror(session, use_dmabuf=use_dmabuf)
+            mirror.build()
+            mirror.watch_config()
+            if mirror.run():
+                return 0
+            if use_dmabuf:
+                log("zero-copy path failed, retrying with CPU conversion")
+        return 1
+    finally:
+        session.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

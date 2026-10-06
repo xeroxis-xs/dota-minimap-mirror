@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Steam launch wrapper: turns the square display on, mirrors the minimap onto
+# it for as long as the game runs, then turns the display back off.
+#
+# Set this in Steam as the game's launch options:
+#   ~/.local/bin/dota-minimap-wrapper %command%
+
+set -uo pipefail
+
+OUTPUT="${MINIMAP_OUTPUT:-HDMI-A-1}"
+POSITION="${MINIMAP_POSITION:-1377,1440}"
+BRIGHTNESS="${MINIMAP_BRIGHTNESS:-}"  # 0-100, leave empty to keep the panel's last brightness
+MIRROR="$HOME/.local/bin/dota-minimap-mirror"
+LOG="${XDG_RUNTIME_DIR:-/tmp}/dota-minimap.log"
+
+mirror_pid=""
+
+cleanup() {
+    if [[ -n "$mirror_pid" ]]; then
+        kill "$mirror_pid" 2>/dev/null
+        wait "$mirror_pid" 2>/dev/null
+    fi
+    kscreen-doctor "output.$OUTPUT.disable" >>"$LOG" 2>&1
+}
+trap cleanup EXIT INT TERM
+
+{
+    echo "=== $(date '+%F %T') launching ==="
+    kscreen-doctor "output.$OUTPUT.enable" "output.$OUTPUT.position.$POSITION"
+} >"$LOG" 2>&1
+
+# Give KWin a moment to bring the output up before the sink asks to fullscreen on it.
+sleep 2
+
+if [[ -n "$BRIGHTNESS" ]]; then
+    kscreen-doctor "output.$OUTPUT.brightness.$BRIGHTNESS" >>"$LOG" 2>&1
+fi
+
+"$MIRROR" >>"$LOG" 2>&1 &
+mirror_pid=$!
+
+"$@"

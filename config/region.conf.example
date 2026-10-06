@@ -1,0 +1,10 @@
+# Region of the ultrawide to mirror onto the square display.
+# Coordinates are in pixels, relative to the top-left of the captured output.
+# Edited values are picked up live while the mirror is running.
+
+CROP_X=0
+CROP_Y=1070
+CROP_W=370
+CROP_H=370
+
+TARGET_OUTPUT=HDMI-A-1
