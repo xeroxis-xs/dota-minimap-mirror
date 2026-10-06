@@ -49,7 +49,9 @@ configured rectangle and renders it fullscreen on the target output via
 entirely on the GPU — no frame is copied to the CPU.
 
 The one-time screen-sharing permission prompt is answered once; a **restore
-token** is saved so every subsequent launch is silent.
+token** is saved so every subsequent launch is silent. The mouse cursor is
+requested in `embedded` mode, so it's composited into the mirrored frames
+whenever it's over the captured region.
 
 ## Requirements
 

@@ -30,7 +30,7 @@ PORTAL_PATH = "/org/freedesktop/portal/desktop"
 SCREENCAST_IFACE = "org.freedesktop.portal.ScreenCast"
 
 SOURCE_TYPE_MONITOR = 1
-CURSOR_MODE_HIDDEN = 1
+CURSOR_MODE_EMBEDDED = 2
 PERSIST_UNTIL_REVOKED = 2
 
 DEFAULTS = {
@@ -166,7 +166,7 @@ class PortalSession:
                 "handle_token": GLib.Variant("s", token),
                 "types": GLib.Variant("u", SOURCE_TYPE_MONITOR),
                 "multiple": GLib.Variant("b", False),
-                "cursor_mode": GLib.Variant("u", CURSOR_MODE_HIDDEN),
+                "cursor_mode": GLib.Variant("u", CURSOR_MODE_EMBEDDED),
                 "persist_mode": GLib.Variant("u", PERSIST_UNTIL_REVOKED),
             }
             if restore_token:
